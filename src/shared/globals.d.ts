@@ -75,7 +75,41 @@ interface AccountState {
 
 interface Bookmark { id: string; title: string; url: string; added: number }
 interface HistoryEntry { url: string; title: string; visited: number }
-interface BrowserSettings { searchEngine: string; homepage: string; restoreTabs: boolean }
+type ParentalProfile = 'adult' | 'malware';
+interface BrowserSettings {
+  searchEngine: string;
+  homepage: string;
+  restoreTabs: boolean;
+  proxyEnabled: boolean;
+  proxyServer: string;
+  proxyUsername: string;
+  proxyAuthConfigured: boolean;
+  parentalEnabled: boolean;
+  blockedDomains: string[];
+  parentalProfiles: ParentalProfile[];
+  parentalListCounts: { adult: number; malware: number };
+  parentalListsUpdatedAt: number | null;
+  parentalPinConfigured: boolean;
+}
+
+interface DownloadEntry {
+  id: string;
+  filename: string;
+  url: string;
+  path: string;
+  receivedBytes: number;
+  totalBytes: number;
+  state: 'progress' | 'completed' | 'cancelled' | 'interrupted';
+  started: number;
+  ended: number | null;
+}
+
+interface ProxyConfig {
+  enabled: boolean;
+  server: string;
+  username: string;
+  password: string;
+}
 
 interface AboutInfo {
   version: string;
@@ -133,9 +167,22 @@ interface DarkApi {
     remove(url: string, visited: number): Promise<HistoryEntry[]>;
     clear(): Promise<HistoryEntry[]>;
   };
+  downloads: {
+    list(): Promise<DownloadEntry[]>;
+    remove(id: string): Promise<DownloadEntry[]>;
+    clear(): Promise<DownloadEntry[]>;
+    open(id: string): Promise<void>;
+    show(id: string): Promise<void>;
+    onChanged(cb: (entries: DownloadEntry[]) => void): void;
+  };
   settings: {
     get(): Promise<BrowserSettings>;
-    set(patch: Partial<BrowserSettings>): Promise<BrowserSettings>;
+    set(patch: Partial<BrowserSettings>, pin?: string): Promise<BrowserSettings>;
+  };
+  proxy: { set(config: ProxyConfig, pin?: string): Promise<BrowserSettings> };
+  parental: {
+    configure(config: { enabled: boolean; blockedDomains: string[]; profiles?: ParentalProfile[]; pin?: string; newPin?: string; confirmPin?: string }): Promise<BrowserSettings>;
+    updateLists(profiles: ParentalProfile[], pin?: string): Promise<BrowserSettings>;
   };
   about(): Promise<AboutInfo>;
   confirm(message: string): Promise<boolean>;

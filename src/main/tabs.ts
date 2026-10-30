@@ -4,13 +4,26 @@ import type { MenuItemConstructorOptions } from 'electron';
 /** Высота интерфейса браузера: полоса вкладок (40) + панель навигации (48). */
 export const CHROME_HEIGHT = 88;
 
-export const isInternal = (u: string): boolean => u.startsWith('dark://');
+export const isInternal = (u: string): boolean => /^dark:\/\//i.test(u);
 export const isNavigable = (u: string): boolean => /^(https?:|dark:)/i.test(u) || u === 'about:blank';
+
+function sameInternalUrl(url: string, expected: string): boolean {
+  try {
+    const actual = new URL(url);
+    const target = new URL(expected);
+    return actual.protocol === target.protocol && actual.host === target.host &&
+      actual.pathname.replace(/\/+$/, '') === target.pathname.replace(/\/+$/, '') &&
+      actual.search === target.search && actual.hash === target.hash;
+  } catch {
+    return false;
+  }
+}
 
 export interface TabHooks {
   changed(): void;
   visited(url: string, title: string): void;
   searchUrl(text: string): string;
+  blocked(url: string): boolean;
   focusOmnibox(): void;
   /** Ссылка на внешнюю схему (tg://, mailto: …): откроет приложение после подтверждения. */
   external(url: string, from: string): void;
@@ -22,6 +35,7 @@ class Tab {
   url = '';
   favicon: string | null = null;
   loading = false;
+  allowedInternalUrl: string | null = null;
   constructor(readonly id: number, readonly view: WebContentsView) {}
 }
 
@@ -64,10 +78,12 @@ export class TabManager {
       },
     });
     const tab = new Tab(this.nextId++, view);
-    tab.url = url;
+    const target = this.navigationTarget(url);
+    tab.url = target;
+    tab.allowedInternalUrl = isInternal(target) ? target : null;
     this.tabs.push(tab);
     this.bind(tab);
-    void view.webContents.loadURL(url).catch(() => undefined);
+    void view.webContents.loadURL(target).catch(() => undefined);
     if (activate) {
       this.activate(tab.id);
       if (url.startsWith('dark://home')) this.hooks.focusOmnibox();
@@ -119,7 +135,9 @@ export class TabManager {
   navigate(url: string): void {
     const t = this.active();
     if (!t || !isNavigable(url)) return;
-    void t.view.webContents.loadURL(url).catch(() => undefined);
+    const target = this.navigationTarget(url);
+    t.allowedInternalUrl = isInternal(target) ? target : null;
+    void t.view.webContents.loadURL(target).catch(() => undefined);
   }
 
   back(): void {
@@ -178,25 +196,42 @@ export class TabManager {
     return isInternal(url) ? url.replace(/\/$/, '') : url;
   }
 
+  private navigationTarget(url: string): string {
+    return this.hooks.blocked(url) ? this.blockedPage(url) : url;
+  }
+
+  private blockedPage(url: string): string {
+    return `dark://blocked/?url=${encodeURIComponent(url)}`;
+  }
+
   private bind(tab: Tab): void {
     const wc = tab.view.webContents;
     const changed = (): void => this.hooks.changed();
 
     wc.setWindowOpenHandler(({ url }) => {
+      if (isInternal(url) && !isInternal(wc.getURL())) return { action: 'deny' };
       if (isNavigable(url) && url !== 'about:blank') this.create(url, true);
       else this.hooks.external(url, wc.getURL());
       return { action: 'deny' };
     });
 
     wc.on('will-navigate', (e, url) => {
-      if (isNavigable(url)) return;
+      const internalAllowed = !isInternal(url) || isInternal(wc.getURL()) ||
+        (!!tab.allowedInternalUrl && sameInternalUrl(url, tab.allowedInternalUrl));
+      if (isNavigable(url) && internalAllowed && !this.hooks.blocked(url)) return;
       e.preventDefault();
-      this.hooks.external(url, wc.getURL());
+      if (!internalAllowed) return;
+      if (isNavigable(url)) void wc.loadURL(this.blockedPage(url)).catch(() => undefined);
+      else this.hooks.external(url, wc.getURL());
     });
     wc.on('will-redirect', (e, url) => {
-      if (isNavigable(url)) return;
+      const internalAllowed = !isInternal(url) || isInternal(wc.getURL()) ||
+        (!!tab.allowedInternalUrl && sameInternalUrl(url, tab.allowedInternalUrl));
+      if (isNavigable(url) && internalAllowed && !this.hooks.blocked(url)) return;
       e.preventDefault();
-      this.hooks.external(url, wc.getURL());
+      if (!internalAllowed) return;
+      if (isNavigable(url)) void wc.loadURL(this.blockedPage(url)).catch(() => undefined);
+      else this.hooks.external(url, wc.getURL());
     });
 
     wc.on('page-title-updated', (_e, title) => {
@@ -217,6 +252,7 @@ export class TabManager {
     });
     wc.on('did-navigate', (_e, url) => {
       tab.url = url;
+      if (tab.allowedInternalUrl && sameInternalUrl(url, tab.allowedInternalUrl)) tab.allowedInternalUrl = null;
       tab.favicon = null;
       changed();
     });
@@ -255,11 +291,10 @@ export class TabManager {
       const nav = wc.navigationHistory;
       const items: MenuItemConstructorOptions[] = [];
       if (p.linkURL && isNavigable(p.linkURL)) {
-        items.push(
-          { label: 'Открыть ссылку в новой вкладке', click: () => void this.create(p.linkURL, false) },
-          { label: 'Копировать адрес ссылки', click: () => clipboard.writeText(p.linkURL) },
-          { type: 'separator' },
-        );
+        if (!isInternal(p.linkURL) || isInternal(wc.getURL())) {
+          items.push({ label: 'Открыть ссылку в новой вкладке', click: () => void this.create(p.linkURL, false) });
+        }
+        items.push({ label: 'Копировать адрес ссылки', click: () => clipboard.writeText(p.linkURL) }, { type: 'separator' });
       }
       if (p.mediaType === 'image' && /^https?:/i.test(p.srcURL)) {
         items.push(

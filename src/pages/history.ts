@@ -27,7 +27,7 @@
       h('div', { class: 'eyebrow' }, 'Dark.Browser'),
       h('h1', null, 'История'),
       h('p', null, 'Посещённые страницы. Хранится на этом компьютере.'),
-      h('div', { class: 'card' }, h('div', { class: 'toolbar' }, search, clearBtn), body),
+      h('div', { class: 'card' }, h('div', { class: 'toolbar' }, search, h('a', { class: 'btn', href: 'dark://downloads' }, 'Загрузки'), clearBtn), body),
     );
     return { body, search };
   }

@@ -309,9 +309,22 @@ if (location.protocol === 'dark:') {
       remove: (url, visited) => call('history:remove', url, visited),
       clear: () => call('history:clear'),
     },
+    downloads: {
+      list: () => call('downloads:list'),
+      remove: (id) => call('downloads:remove', id),
+      clear: () => call('downloads:clear'),
+      open: (id) => call('downloads:open', id),
+      show: (id) => call('downloads:show', id),
+      onChanged: (cb) => ipcRenderer.on('downloads:changed', (_e, entries: DownloadEntry[]) => cb(entries)),
+    },
     settings: {
       get: () => call('settings:get'),
-      set: (patch) => call('settings:set', patch),
+      set: (patch, pin) => call('settings:set', patch, pin),
+    },
+    proxy: { set: (config, pin) => call('proxy:set', config, pin) },
+    parental: {
+      configure: (config) => call('parental:configure', config),
+      updateLists: (profiles, pin) => call('parental:update-lists', profiles, pin),
     },
     about: () => call('about'),
     resolve: (text) => call('nav:resolve', text),

@@ -1,6 +1,6 @@
-import { BrowserWindow, Menu, app, ipcMain, net, protocol, session, shell } from 'electron';
+import { BrowserWindow, Menu, app, ipcMain, net, protocol, safeStorage, session, shell } from 'electron';
 import type { IpcMainEvent, IpcMainInvokeEvent, MenuItemConstructorOptions } from 'electron';
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID, scryptSync, timingSafeEqual } from 'node:crypto';
 import * as path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { AccountService, API_BASE } from './account';
@@ -10,7 +10,7 @@ import { SEARCH_ENGINES, isExternalScheme, resolveInput, searchUrl } from '../sh
 
 const PARTITION = 'persist:dark';
 const DIST = path.join(__dirname, '..');
-const PAGES = new Set(['home', 'account', 'settings', 'bookmarks', 'history', 'error']);
+const PAGES = new Set(['home', 'account', 'settings', 'bookmarks', 'history', 'downloads', 'blocked', 'error']);
 const ASSET_EXT = new Set(['.html', '.js', '.css', '.svg', '.png']);
 const DEV = process.argv.includes('--dev');
 
@@ -19,15 +19,33 @@ protocol.registerSchemesAsPrivileged([{ scheme: 'dark', privileges: { standard: 
 interface Library {
   bookmarks: Bookmark[];
   history: HistoryEntry[];
+  downloads: DownloadEntry[];
   lastTabs: string[];
 }
 
 let win: BrowserWindow | null = null;
 let tabs: TabManager;
-let settings: JsonStore<BrowserSettings>;
+interface StoredBrowserSettings extends BrowserSettings {
+  proxyPasswordEncrypted: string;
+  parentalPinSalt: string;
+  parentalPinHash: string;
+  parentalLists: Record<ParentalProfile, string[]>;
+}
+let settings: JsonStore<StoredBrowserSettings>;
 let library: JsonStore<Library>;
 let account: AccountService;
 let pushTimer: NodeJS.Timeout | null = null;
+let downloadPushTimer: NodeJS.Timeout | null = null;
+let pinFailures = 0;
+let pinLockedUntil = 0;
+let parentalDomainSet = new Set<string>();
+
+const PARENTAL_LIST_SOURCES: Record<ParentalProfile, string> = {
+  adult: 'https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/porn-only/hosts',
+  malware: 'https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts',
+};
+const MAX_PARENTAL_LIST_BYTES = 12 * 1024 * 1024;
+const MAX_PARENTAL_LIST_DOMAINS = 250_000;
 
 type BrowserDialogOptions = Omit<BrowserDialogData, 'id'>;
 
@@ -134,10 +152,13 @@ if (!app.requestSingleInstanceLock()) {
       if (win.isMinimized()) win.restore();
       win.focus();
       const url = argv.find((a) => /^https?:\/\//i.test(a));
-      if (url) tabs.create(url);
+      if (url && tabs) tabs.create(url);
     }
   });
-  void app.whenReady().then(start);
+  void app.whenReady().then(start).catch((error: unknown) => {
+    console.error('Не удалось запустить браузер:', error);
+    app.quit();
+  });
   app.on('window-all-closed', () => app.quit());
   app.on('will-quit', () => {
     library?.flush();
@@ -152,28 +173,104 @@ if (!app.requestSingleInstanceLock()) {
 
 // ───────────────────────── запуск ─────────────────────────
 
-function start(): void {
+async function start(): Promise<void> {
   const userData = app.getPath('userData');
-  settings = new JsonStore<BrowserSettings>(path.join(userData, 'settings.json'), {
+  settings = new JsonStore<StoredBrowserSettings>(path.join(userData, 'settings.json'), {
     searchEngine: 'duckduckgo',
     homepage: 'dark://home',
     restoreTabs: true,
+    proxyEnabled: false,
+    proxyServer: '',
+    proxyUsername: '',
+    proxyAuthConfigured: false,
+    proxyPasswordEncrypted: '',
+    parentalEnabled: false,
+    blockedDomains: [],
+    parentalProfiles: [],
+    parentalListCounts: { adult: 0, malware: 0 },
+    parentalListsUpdatedAt: null,
+    parentalPinConfigured: false,
+    parentalPinSalt: '',
+    parentalPinHash: '',
+    parentalLists: { adult: [], malware: [] },
   });
-  library = new JsonStore<Library>(path.join(userData, 'library.json'), { bookmarks: [], history: [], lastTabs: [] });
+  refreshParentalDomainCache();
+  library = new JsonStore<Library>(path.join(userData, 'library.json'), { bookmarks: [], history: [], downloads: [], lastTabs: [] });
   account = new AccountService(userData);
   account.on('change', () => {
     broadcastAccount();
     pushState();
   });
 
-  setupSession();
+  await setupSession();
   createWindow();
   registerIpc();
   buildMenu();
 }
 
-function setupSession(): void {
+async function setupSession(): Promise<void> {
   const ses = session.fromPartition(PARTITION);
+  const saved = settings.get();
+  await ses.setProxy(saved.proxyEnabled ? { proxyRules: saved.proxyServer } : { mode: 'system' });
+  if (saved.proxyEnabled) await ses.closeAllConnections();
+
+  app.on('login', (event, webContents, _details, authInfo, callback) => {
+    if (!webContents || webContents.session !== ses) return;
+    const config = settings.get();
+    if (!authInfo.isProxy || !config.proxyEnabled || !config.proxyUsername || !config.proxyPasswordEncrypted) return;
+    try {
+      const proxy = new URL(config.proxyServer);
+      if (proxy.hostname.toLowerCase() !== authInfo.host.toLowerCase() ||
+          authInfo.port !== Number(proxy.port || (proxy.protocol === 'https:' ? 443 : proxy.protocol === 'http:' ? 80 : 1080))) return;
+      event.preventDefault();
+      callback(config.proxyUsername, safeStorage.decryptString(Buffer.from(config.proxyPasswordEncrypted, 'base64')));
+    } catch (error) {
+      event.preventDefault();
+      console.error('Не удалось обработать авторизацию прокси:', error);
+      callback('', '');
+    }
+  });
+  ses.on('will-download', (_event, item) => {
+    const id = randomUUID();
+    const blocked = isParentalDomainBlocked(item.getURL());
+    const entry: DownloadEntry = {
+      id,
+      filename: item.getFilename(),
+      url: item.getURL(),
+      path: item.getSavePath(),
+      receivedBytes: item.getReceivedBytes(),
+      totalBytes: item.getTotalBytes(),
+      state: 'progress',
+      started: Date.now(),
+      ended: null,
+    };
+    updateDownload(entry);
+    item.on('updated', (_updateEvent, state) => {
+      updateDownload({
+        ...entry,
+        filename: item.getFilename(),
+        path: item.getSavePath(),
+        receivedBytes: item.getReceivedBytes(),
+        totalBytes: item.getTotalBytes(),
+        state: state === 'interrupted' ? 'interrupted' : 'progress',
+      });
+    });
+    item.once('done', (_doneEvent, state) => {
+      updateDownload({
+        ...entry,
+        filename: item.getFilename(),
+        path: item.getSavePath(),
+        receivedBytes: item.getReceivedBytes(),
+        totalBytes: item.getTotalBytes(),
+        state,
+        ended: Date.now(),
+      });
+    });
+    if (blocked) item.cancel();
+  });
+  ses.webRequest.onBeforeRequest({ urls: ['http://*/*', 'https://*/*'] }, (details, callback) => {
+    callback({ cancel: details.resourceType !== 'mainFrame' && isParentalDomainBlocked(details.url) });
+  });
 
   // Чистый UA как у обычного Chrome (без «Electron/…» и имени приложения):
   // с лишними токенами Google и часть других сайтов считают клиент ботом.
@@ -257,6 +354,7 @@ function createWindow(): void {
     changed: pushState,
     visited: addHistory,
     searchUrl: (text) => searchUrl(settings.get().searchEngine, text),
+    blocked: isParentalDomainBlocked,
     external: openExternalLink,
     focusOmnibox: () => {
       w.webContents.focus();
@@ -324,6 +422,194 @@ function addHistory(url: string, title: string): void {
   library.patch({ history: [{ url, title, visited: now }, ...h].slice(0, 2000) });
 }
 
+function updateDownload(entry: DownloadEntry): void {
+  const downloads = library.get().downloads;
+  const index = downloads.findIndex((item) => item.id === entry.id);
+  const next = index < 0
+    ? [entry, ...downloads].slice(0, 1000)
+    : downloads.map((item) => item.id === entry.id ? entry : item);
+  library.patch({ downloads: next });
+  if (downloadPushTimer) return;
+  downloadPushTimer = setTimeout(() => {
+    downloadPushTimer = null;
+    for (const tab of tabs?.all() ?? []) {
+      if (tab.url.startsWith('dark://downloads') && !tab.view.webContents.isDestroyed()) {
+        tab.view.webContents.send('downloads:changed', library.get().downloads);
+      }
+    }
+  }, 250);
+}
+
+function isParentalDomainBlocked(url: string): boolean {
+  if (!settings.get().parentalEnabled) return false;
+  let hostname: string;
+  try {
+    hostname = new URL(url).hostname.toLowerCase().replace(/\.$/, '');
+  } catch {
+    return false;
+  }
+  let domain = hostname;
+  while (domain) {
+    if (parentalDomainSet.has(domain)) return true;
+    const dot = domain.indexOf('.');
+    if (dot < 0) break;
+    domain = domain.slice(dot + 1);
+  }
+  return false;
+}
+
+function refreshParentalDomainCache(): void {
+  const config = settings.get();
+  parentalDomainSet = new Set(config.blockedDomains);
+  for (const profile of config.parentalProfiles) {
+    for (const domain of config.parentalLists[profile] ?? []) parentalDomainSet.add(domain);
+  }
+}
+
+function enforceParentalBlockOnOpenTabs(): void {
+  for (const tab of tabs.all()) {
+    if (isParentalDomainBlocked(tab.url)) tabs.navigate(tab.url);
+  }
+}
+
+function parseParentalList(content: string, profile: ParentalProfile): string[] {
+  const domains = new Set<string>();
+  for (const line of content.split(/\r?\n/)) {
+    const fields = line.split('#', 1)[0].trim().split(/\s+/);
+    if (fields.length < 2 || !/^(?:\d{1,3}\.){3}\d{1,3}$/.test(fields[0]) && fields[0] !== '::') continue;
+    for (const candidate of fields.slice(1)) {
+      const domain = candidate.toLowerCase().replace(/\.$/, '');
+      if (domain.length > 253 || !domain.includes('.') || /^\d+(?:\.\d+){3}$/.test(domain)) continue;
+      const labels = domain.split('.');
+      if (labels.some((label) => label.length > 63 || !/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(label))) continue;
+      domains.add(domain);
+      if (domains.size > MAX_PARENTAL_LIST_DOMAINS) {
+        throw new Error('Список содержит слишком много доменов.');
+      }
+    }
+  }
+  if (domains.size < 1000) throw new Error(`Полученный список «${profile}» пуст или повреждён; сохранённая версия не изменена.`);
+  return [...domains];
+}
+
+function normalizeParentalProfiles(input: unknown): ParentalProfile[] {
+  if (!Array.isArray(input) || input.length > 2) throw new Error('Некорректный набор сценариев защиты.');
+  const profiles: ParentalProfile[] = [];
+  for (const profile of input) {
+    if (profile !== 'adult' && profile !== 'malware') throw new Error('Некорректный набор сценариев защиты.');
+    profiles.push(profile);
+  }
+  return [...new Set(profiles)];
+}
+
+async function fetchParentalList(profile: ParentalProfile): Promise<string[]> {
+  const response = await net.fetch(PARENTAL_LIST_SOURCES[profile], {
+    redirect: 'error',
+    signal: AbortSignal.timeout(30_000),
+  });
+  if (!response.ok) throw new Error(`Источник списка «${profile}» вернул HTTP ${response.status}.`);
+  const contentLength = Number(response.headers.get('content-length') ?? 0);
+  if (contentLength > MAX_PARENTAL_LIST_BYTES) throw new Error(`Список «${profile}» превышает допустимый размер.`);
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error(`Источник списка «${profile}» вернул пустой ответ.`);
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > MAX_PARENTAL_LIST_BYTES) {
+        void reader.cancel();
+        throw new Error(`Список «${profile}» превышает допустимый размер.`);
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return parseParentalList(new TextDecoder().decode(bytes), profile);
+}
+
+function normalizeBlockedDomains(input: unknown): string[] {
+  if (!Array.isArray(input) || input.length > 100) throw new Error('Укажите не более 100 доменов.');
+  const domains = new Set<string>();
+  for (const value of input) {
+    if (typeof value !== 'string' || value.length > 300) throw new Error('Некорректный домен в списке.');
+    const raw = value.trim().toLowerCase();
+    if (!raw) continue;
+    let hostname: string;
+    try {
+      hostname = new URL(raw.includes('://') ? raw : `https://${raw}`).hostname.toLowerCase();
+    } catch {
+      throw new Error(`Некорректный домен: ${raw}`);
+    }
+    if (!hostname || !/^[a-z0-9.-]+$/.test(hostname) || hostname.startsWith('.') || hostname.endsWith('.') || hostname.includes('..')) {
+      throw new Error(`Некорректный домен: ${raw}`);
+    }
+    domains.add(hostname);
+  }
+  return [...domains];
+}
+
+function publicSettings(): BrowserSettings {
+  const current = settings.get();
+  return {
+    searchEngine: current.searchEngine,
+    homepage: current.homepage,
+    restoreTabs: current.restoreTabs,
+    proxyEnabled: current.proxyEnabled,
+    proxyServer: current.proxyServer,
+    proxyUsername: current.proxyUsername,
+    proxyAuthConfigured: !!current.proxyPasswordEncrypted,
+    parentalEnabled: current.parentalEnabled,
+    blockedDomains: [...current.blockedDomains],
+    parentalProfiles: [...current.parentalProfiles],
+    parentalListCounts: {
+      adult: current.parentalLists.adult?.length ?? 0,
+      malware: current.parentalLists.malware?.length ?? 0,
+    },
+    parentalListsUpdatedAt: current.parentalListsUpdatedAt,
+    parentalPinConfigured: !!current.parentalPinSalt && !!current.parentalPinHash,
+  };
+}
+
+function verifyParentalPin(pin: unknown): boolean {
+  const current = settings.get();
+  if (!current.parentalPinSalt || !current.parentalPinHash || typeof pin !== 'string' || !/^\d{4,12}$/.test(pin)) return false;
+  const actual = scryptSync(pin, Buffer.from(current.parentalPinSalt, 'base64'), 64);
+  const expected = Buffer.from(current.parentalPinHash, 'base64');
+  return expected.length === actual.length && timingSafeEqual(actual, expected);
+}
+
+function requireParentalPin(pin: unknown): void {
+  const remaining = pinLockedUntil - Date.now();
+  if (remaining > 0) throw new Error(`Слишком много попыток. Повторите через ${Math.ceil(remaining / 1000)} сек.`);
+  if (verifyParentalPin(pin)) {
+    pinFailures = 0;
+    return;
+  }
+  pinFailures++;
+  if (pinFailures >= 5) {
+    pinFailures = 0;
+    pinLockedUntil = Date.now() + 60_000;
+    throw new Error('Слишком много неверных PIN-кодов. Повторите через минуту.');
+  }
+  throw new Error('Неверный PIN-код родителя.');
+}
+
+function newParentalPin(pin: unknown): { salt: string; hash: string } {
+  if (typeof pin !== 'string' || !/^\d{4,12}$/.test(pin)) throw new Error('PIN-код должен содержать от 4 до 12 цифр.');
+  const salt = randomBytes(16);
+  return { salt: salt.toString('base64'), hash: scryptSync(pin, salt, 64).toString('base64') };
+}
+
 function toggleBookmark(): void {
   const t = tabs.active();
   if (!t || !isNavigable(t.url) || t.url === 'about:blank' || t.url.startsWith('dark://error')) return;
@@ -386,7 +672,13 @@ const str = (v: unknown, max = 2000): string => (typeof v === 'string' ? v.slice
 
 function fromInternalPage(e: IpcMainInvokeEvent): boolean {
   const f = e.senderFrame;
-  return !!f && f === e.sender.mainFrame && f.url.startsWith('dark://');
+  if (!f || f !== e.sender.mainFrame) return false;
+  try {
+    const url = new URL(f.url);
+    return url.protocol === 'dark:' && PAGES.has(url.hostname);
+  } catch {
+    return false;
+  }
 }
 
 function page<A extends unknown[], R>(channel: string, fn: (...a: A) => R | Promise<R>): void {
@@ -511,8 +803,29 @@ function registerIpc(): void {
     library.patch({ history: [] });
     return [];
   });
-  page('settings:get', () => settings.get());
-  page('settings:set', (patch: Partial<BrowserSettings>) => {
+  page('downloads:list', () => library.get().downloads);
+  page('downloads:remove', (id: unknown) => {
+    library.patch({ downloads: library.get().downloads.filter((item) => item.id !== id) });
+    return library.get().downloads;
+  });
+  page('downloads:clear', () => {
+    library.patch({ downloads: [] });
+    return [];
+  });
+  page('downloads:open', async (id: unknown) => {
+    const item = library.get().downloads.find((entry) => entry.id === id);
+    if (!item || item.state !== 'completed' || !item.path) throw new Error('Файл недоступен.');
+    const error = await shell.openPath(item.path);
+    if (error) throw new Error(`Не удалось открыть файл: ${error}`);
+  });
+  page('downloads:show', (id: unknown) => {
+    const item = library.get().downloads.find((entry) => entry.id === id);
+    if (!item || !item.path) throw new Error('Путь к файлу недоступен.');
+    shell.showItemInFolder(item.path);
+  });
+  page('settings:get', () => publicSettings());
+  page('settings:set', (patch: Partial<BrowserSettings>, pin: unknown) => {
+    if (settings.get().parentalEnabled) requireParentalPin(pin);
     const next: Partial<BrowserSettings> = {};
     if (typeof patch?.searchEngine === 'string' && patch.searchEngine in SEARCH_ENGINES) next.searchEngine = patch.searchEngine;
     if (typeof patch?.restoreTabs === 'boolean') next.restoreTabs = patch.restoreTabs;
@@ -521,7 +834,113 @@ function registerIpc(): void {
       next.homepage = /^(https?|dark):/i.test(h) && !/^https?:\/\/(duckduckgo|yandex|www\.google|www\.bing)/.test(h) ? h : 'dark://home';
     }
     settings.patch(next);
-    return settings.get();
+    return publicSettings();
+  });
+  page('proxy:set', async (config: ProxyConfig, pin: unknown) => {
+    if (settings.get().parentalEnabled) requireParentalPin(pin);
+    if (typeof config?.enabled !== 'boolean') throw new Error('Укажите состояние прокси.');
+    let server = str(config.server, 500).trim();
+    const username = str(config.username, 256).trim();
+    const password = str(config.password, 1024);
+    if (config.enabled) {
+      let parsed: URL;
+      try {
+        parsed = new URL(server);
+      } catch {
+        throw new Error('Введите адрес прокси в формате http://host:port или socks5://host:port.');
+      }
+      if (!['http:', 'https:', 'socks4:', 'socks5:'].includes(parsed.protocol) || !parsed.hostname ||
+          parsed.username || parsed.password || parsed.pathname !== '/' || parsed.search || parsed.hash) {
+        throw new Error('Поддерживаются только http(s), socks4 и socks5 без логина и пароля в URL.');
+      }
+      server = `${parsed.protocol}//${parsed.host}`;
+    }
+    let proxyPasswordEncrypted = settings.get().proxyPasswordEncrypted;
+    if (!username) {
+      proxyPasswordEncrypted = '';
+    } else if (password) {
+      if (!safeStorage.isEncryptionAvailable()) throw new Error('Безопасное хранилище системы недоступно: пароль прокси нельзя сохранить.');
+      proxyPasswordEncrypted = safeStorage.encryptString(password).toString('base64');
+    } else if (server !== settings.get().proxyServer || username !== settings.get().proxyUsername || !proxyPasswordEncrypted) {
+      throw new Error('Введите пароль прокси или оставьте прежние адрес и логин.');
+    }
+    const ses = session.fromPartition(PARTITION);
+    const previous = settings.get();
+    try {
+      await ses.setProxy(config.enabled ? { proxyRules: server } : { mode: 'system' });
+      await ses.closeAllConnections();
+    } catch (error) {
+      try {
+        await ses.setProxy(previous.proxyEnabled ? { proxyRules: previous.proxyServer } : { mode: 'system' });
+        await ses.closeAllConnections();
+      } catch (rollbackError) {
+        console.error('Не удалось восстановить прежние настройки прокси:', rollbackError);
+        throw new Error('Не удалось применить прокси и восстановить прежнее подключение.');
+      }
+      throw error;
+    }
+    settings.patch({
+      proxyEnabled: config.enabled,
+      proxyServer: server,
+      proxyUsername: username,
+      proxyAuthConfigured: !!proxyPasswordEncrypted,
+      proxyPasswordEncrypted,
+    });
+    return publicSettings();
+  });
+  page('parental:update-lists', async (profiles: unknown, pin: unknown) => {
+    const selected = normalizeParentalProfiles(profiles);
+    const current = settings.get();
+    if (current.parentalPinSalt && current.parentalPinHash) requireParentalPin(pin);
+    if (!selected.length) {
+      settings.patch({ parentalProfiles: [] });
+      refreshParentalDomainCache();
+      return publicSettings();
+    }
+    const fetched = await Promise.all(selected.map(async (profile) => [profile, await fetchParentalList(profile)] as const));
+    const parentalLists = { ...current.parentalLists };
+    for (const [profile, domains] of fetched) parentalLists[profile] = domains;
+    settings.patch({
+      parentalProfiles: selected,
+      parentalLists,
+      parentalListCounts: {
+        adult: parentalLists.adult.length,
+        malware: parentalLists.malware.length,
+      },
+      parentalListsUpdatedAt: Date.now(),
+    });
+    refreshParentalDomainCache();
+    enforceParentalBlockOnOpenTabs();
+    return publicSettings();
+  });
+  page('parental:configure', (config: { enabled?: unknown; blockedDomains?: unknown; profiles?: unknown; pin?: unknown; newPin?: unknown; confirmPin?: unknown }) => {
+    if (typeof config?.enabled !== 'boolean') throw new Error('Укажите состояние родительского контроля.');
+    const current = settings.get();
+    const pinConfigured = !!current.parentalPinSalt && !!current.parentalPinHash;
+    if (pinConfigured) requireParentalPin(config.pin);
+    const blockedDomains = normalizeBlockedDomains(config.blockedDomains);
+    const profiles = config.profiles === undefined ? current.parentalProfiles : normalizeParentalProfiles(config.profiles);
+    let pin = { salt: current.parentalPinSalt, hash: current.parentalPinHash };
+    if (typeof config.newPin === 'string' && config.newPin) {
+      if (config.newPin !== config.confirmPin) throw new Error('PIN-коды не совпадают.');
+      pin = newParentalPin(config.newPin);
+    }
+    else if (!pinConfigured && config.enabled) throw new Error('Для включения родительского контроля задайте PIN-код.');
+    if (config.enabled && !pin.salt) throw new Error('Для включения родительского контроля задайте PIN-код.');
+    if (config.enabled && profiles.some((profile) => !current.parentalLists[profile]?.length)) {
+      throw new Error('Сначала скачайте выбранные списки защиты.');
+    }
+    settings.patch({
+      parentalEnabled: config.enabled,
+      blockedDomains,
+      parentalProfiles: profiles,
+      parentalPinSalt: pin.salt,
+      parentalPinHash: pin.hash,
+      parentalPinConfigured: !!pin.salt && !!pin.hash,
+    });
+    refreshParentalDomainCache();
+    enforceParentalBlockOnOpenTabs();
+    return publicSettings();
   });
   page('about', (): AboutInfo => ({
     version: app.getVersion(),
@@ -614,6 +1033,7 @@ function appMenuItems(): MenuItemConstructorOptions[] {
     { label: 'Новая вкладка', accelerator: 'CmdOrCtrl+T', click: () => tabs.create(homepage()) },
     { label: 'Закладки', accelerator: 'CmdOrCtrl+Shift+O', click: () => tabs.openInternal('dark://bookmarks') },
     { label: 'История', accelerator: 'CmdOrCtrl+H', click: () => tabs.openInternal('dark://history') },
+    { label: 'Загрузки', accelerator: 'CmdOrCtrl+J', click: () => tabs.openInternal('dark://downloads') },
     { label: 'Аккаунт', click: () => tabs.openInternal('dark://account') },
     { label: 'Настройки', accelerator: 'CmdOrCtrl+,', click: () => tabs.openInternal('dark://settings') },
     { type: 'separator' },
@@ -674,6 +1094,7 @@ function buildMenu(): void {
         { label: 'Добавить в закладки', accelerator: 'CmdOrCtrl+D', click: toggleBookmark },
         { label: 'Закладки', accelerator: 'CmdOrCtrl+Shift+O', click: () => tabs.openInternal('dark://bookmarks') },
         { label: 'История', accelerator: 'CmdOrCtrl+H', click: () => tabs.openInternal('dark://history') },
+        { label: 'Загрузки', accelerator: 'CmdOrCtrl+J', click: () => tabs.openInternal('dark://downloads') },
       ],
     },
     {
