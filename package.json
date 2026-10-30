@@ -1,0 +1,45 @@
+{
+  "name": "dark-browser",
+  "productName": "Dark Browser",
+  "version": "1.0.0",
+  "description": "Dark.Browser — браузер Dark.Tehno с привязкой к Dark.Account",
+  "author": "Владимир (vsp210) / Dark.Tehno",
+  "license": "UNLICENSED",
+  "private": true,
+  "main": "dist/main/main.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.node.json && tsc -p tsconfig.web.json && node scripts/copy-static.mjs",
+    "start": "npm run build && electron .",
+    "dev": "npm run build && electron . --dev",
+    "typecheck": "tsc -p tsconfig.node.json --noEmit && tsc -p tsconfig.web.json --noEmit",
+    "dist": "npm run build && electron-builder"
+  },
+  "build": {
+    "appId": "ru.vsp210.darkbrowser",
+    "productName": "Dark Browser",
+    "files": [
+      "dist/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": "nsis"
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "category": "Network"
+    },
+    "mac": {
+      "target": "dmg",
+      "category": "public.app-category.productivity"
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "electron": "^45.1.0",
+    "electron-builder": "^26.18.0",
+    "typescript": "^7.0.2"
+  }
+}
