@@ -39,6 +39,7 @@ let downloadPushTimer: NodeJS.Timeout | null = null;
 let pinFailures = 0;
 let pinLockedUntil = 0;
 let parentalDomainSet = new Set<string>();
+let pageFindQuery = '';
 
 const PARENTAL_LIST_SOURCES: Record<ParentalProfile, string> = {
   adult: 'https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/porn-only/hosts',
@@ -666,6 +667,50 @@ function openExternalLink(url: string, from: string): void {
 const homepage = (): string => settings.get().homepage;
 const resolve = (text: string): string => resolveInput(text, settings.get().searchEngine, homepage());
 
+function runPageFind(query: string, direction: 'first' | 'next' | 'prev' = 'first'): void {
+  const active = tabs?.active();
+  if (!active) return;
+  const raw = str(query, 500).trim();
+  if (!raw) {
+    active.view.webContents.stopFindInPage('clearSelection');
+    pageFindQuery = '';
+    return;
+  }
+  pageFindQuery = raw;
+  active.view.webContents.findInPage(raw, {
+    findNext: direction !== 'first',
+    forward: direction !== 'prev',
+    matchCase: false,
+  });
+}
+
+function openPageFindDialog(): void {
+  const active = tabs?.active();
+  if (!active || !win || win.isDestroyed()) return;
+  void openBrowserDialog({
+    kind: 'question',
+    title: 'Поиск по странице',
+    message: 'Введите текст, который нужно найти в текущей странице.',
+    buttons: ['Найти', 'Отмена'],
+    defaultId: 0,
+    cancelId: 1,
+    input: { value: pageFindQuery },
+  })
+    .then((result) => {
+      const value = str(result.value, 500).trim();
+      if (result.response === 0 && value) {
+        pageFindQuery = value;
+        runPageFind(value, 'first');
+      } else {
+        active.view.webContents.stopFindInPage('clearSelection');
+        pageFindQuery = '';
+      }
+    })
+    .catch((error: unknown) => {
+      console.error('Не удалось открыть поиск по странице:', error);
+    });
+}
+
 // ───────────────────────── IPC ─────────────────────────
 
 const str = (v: unknown, max = 2000): string => (typeof v === 'string' ? v.slice(0, max) : '');
@@ -735,6 +780,19 @@ function registerIpc(): void {
         break;
       case 'account':
         tabs.openInternal('dark://account');
+        break;
+      case 'find-page':
+        openPageFindDialog();
+        break;
+      case 'find-page-next':
+        runPageFind(pageFindQuery, 'next');
+        break;
+      case 'find-page-prev':
+        runPageFind(pageFindQuery, 'prev');
+        break;
+      case 'find-page-close':
+        if (tabs.active()) tabs.active()!.view.webContents.stopFindInPage('clearSelection');
+        pageFindQuery = '';
         break;
       case 'menu': {
         const p = arg as { x?: number; y?: number } | undefined;
@@ -1034,6 +1092,7 @@ function appMenuItems(): MenuItemConstructorOptions[] {
     { label: 'Закладки', accelerator: 'CmdOrCtrl+Shift+O', click: () => tabs.openInternal('dark://bookmarks') },
     { label: 'История', accelerator: 'CmdOrCtrl+H', click: () => tabs.openInternal('dark://history') },
     { label: 'Загрузки', accelerator: 'CmdOrCtrl+J', click: () => tabs.openInternal('dark://downloads') },
+    { label: 'Поиск по странице', accelerator: 'CmdOrCtrl+F', click: () => openPageFindDialog() },
     { label: 'Аккаунт', click: () => tabs.openInternal('dark://account') },
     { label: 'Настройки', accelerator: 'CmdOrCtrl+,', click: () => tabs.openInternal('dark://settings') },
     { type: 'separator' },
@@ -1082,6 +1141,7 @@ function buildMenu(): void {
       label: 'Навигация',
       submenu: [
         { label: 'Адресная строка', accelerator: 'CmdOrCtrl+L', click: () => { win?.webContents.focus(); win?.webContents.send('chrome:focus-omnibox'); } },
+        { label: 'Поиск по странице', accelerator: 'CmdOrCtrl+F', click: () => openPageFindDialog() },
         { label: 'Назад', accelerator: 'Alt+Left', click: () => tabs.back() },
         { label: 'Вперёд', accelerator: 'Alt+Right', click: () => tabs.forward() },
         { label: 'Обновить', accelerator: 'CmdOrCtrl+R', click: () => tabs.reload() },

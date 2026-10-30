@@ -206,8 +206,13 @@ interface ChromeApi {
   toggleBookmark(): void;
   openAccount(): void;
   showMenu(x: number, y: number): void;
+  findPage(query: string): void;
+  findNext(): void;
+  findPrev(): void;
+  closeFind(): void;
   onState(cb: (s: ChromeState) => void): void;
   onFocusOmnibox(cb: () => void): void;
+  onFocusSearch(cb: () => void): void;
 }
 
 interface BrowserDialogData {
