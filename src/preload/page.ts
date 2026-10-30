@@ -238,6 +238,42 @@ function installNotificationShim(): void {
   });
 }
 
+// alert(), confirm() и prompt() сайтов показываются окном браузера в стиле Dark.Tehno.
+// (prompt() в Электроне вообще не работает, а alert/confirm выглядят как системные.)
+// Мост в основной процесс попадает в страницу через contextBridge под случайным именем.
+function installDialogShims(bridgeName: string): void {
+  type Bridge = (type: string, message: string, value: string) => string | boolean | null;
+  const bridge = (window as unknown as Record<string, unknown>)[bridgeName] as Bridge | undefined;
+  if (typeof bridge !== 'function') return;
+  const text = (args: unknown[]): string => (args.length === 0 ? '' : String(args[0]));
+  const define = (name: string, fn: unknown): void => {
+    Object.defineProperty(window, name, { configurable: true, writable: true, value: fn });
+  };
+  define('alert', function alert(...args: unknown[]): void {
+    bridge('alert', text(args), '');
+  });
+  define('confirm', function confirm(...args: unknown[]): boolean {
+    return bridge('confirm', text(args), '') === true;
+  });
+  define('prompt', function prompt(...args: unknown[]): string | null {
+    const answer = bridge('prompt', text(args), args.length > 1 && args[1] !== undefined && args[1] !== null ? String(args[1]) : '');
+    return typeof answer === 'string' ? answer : null;
+  });
+}
+
+const dialogBridgeName = `__darkDialog_${Math.random().toString(36).slice(2)}`;
+contextBridge.exposeInMainWorld(dialogBridgeName, (type: unknown, message: unknown, value: unknown): string | boolean | null => {
+  const answer: unknown = ipcRenderer.sendSync('browser-dialog-sync', {
+    type: type === 'alert' || type === 'confirm' ? type : 'prompt',
+    message: typeof message === 'string' ? message.slice(0, 2000) : '',
+    value: typeof value === 'string' ? value.slice(0, 2000) : '',
+  });
+  return typeof answer === 'string' || typeof answer === 'boolean' ? answer : null;
+});
+void webFrame.executeJavaScript(`(${installDialogShims.toString()})(${JSON.stringify(dialogBridgeName)})`).catch((error: unknown) => {
+  console.error('Не удалось установить окна alert/confirm/prompt:', error);
+});
+
 void webFrame.executeJavaScript(`(${installNotificationShim.toString()})()`).catch((error: unknown) => {
   console.error('Не удалось установить оформление уведомлений сайта:', error);
 });

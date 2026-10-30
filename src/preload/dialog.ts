@@ -4,8 +4,8 @@ const api: BrowserDialogApi = {
   onShow: (cb) => {
     ipcRenderer.on('browser-dialog:show', (_event, data: BrowserDialogData) => cb(data));
   },
-  respond: (id, response) => {
-    ipcRenderer.send('browser-dialog:response', id, response);
+  respond: (id, response, value) => {
+    ipcRenderer.send('browser-dialog:response', id, response, value);
   },
 };
 

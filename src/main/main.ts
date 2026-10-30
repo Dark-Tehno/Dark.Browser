@@ -31,11 +31,14 @@ let pushTimer: NodeJS.Timeout | null = null;
 
 type BrowserDialogOptions = Omit<BrowserDialogData, 'id'>;
 
-function showBrowserDialog(options: Partial<BrowserDialogOptions> & Pick<BrowserDialogOptions, 'kind' | 'title' | 'message'>): Promise<number> {
+type DialogResult = { response: number; value: string | null };
+
+/** Показывает окно браузера и возвращает номер кнопки и (для prompt) введённый текст. */
+function openBrowserDialog(options: Partial<BrowserDialogOptions> & Pick<BrowserDialogOptions, 'kind' | 'title' | 'message'>): Promise<DialogResult> {
   const parent = win;
   const buttons = options.buttons ?? ['Закрыть'];
   const cancelId = options.cancelId ?? Math.max(0, buttons.length - 1);
-  if (!parent || parent.isDestroyed()) return Promise.resolve(cancelId);
+  if (!parent || parent.isDestroyed()) return Promise.resolve({ response: cancelId, value: null });
 
   const id = randomUUID();
   const data: BrowserDialogData = {
@@ -47,12 +50,13 @@ function showBrowserDialog(options: Partial<BrowserDialogOptions> & Pick<Browser
     buttons,
     defaultId: options.defaultId ?? 0,
     cancelId,
+    ...(options.input ? { input: options.input } : {}),
   };
   let popup: BrowserWindow;
   try {
     popup = new BrowserWindow({
       width: 500,
-      height: 280,
+      height: options.input ? 340 : 280,
       parent,
       modal: true,
       frame: false,
@@ -75,16 +79,16 @@ function showBrowserDialog(options: Partial<BrowserDialogOptions> & Pick<Browser
     return Promise.reject(error);
   }
 
-  return new Promise((resolve, reject) => {
+  return new Promise<DialogResult>((resolve, reject) => {
     let settled = false;
     const cleanup = (): void => {
       ipcMain.removeListener('browser-dialog:response', onResponse);
     };
-    const finish = (response: number): void => {
+    const finish = (response: number, value: string | null = null): void => {
       if (settled) return;
       settled = true;
       cleanup();
-      resolve(response);
+      resolve({ response, value });
       if (!popup.isDestroyed()) popup.close();
     };
     const fail = (error: Error): void => {
@@ -94,10 +98,10 @@ function showBrowserDialog(options: Partial<BrowserDialogOptions> & Pick<Browser
       if (!popup.isDestroyed()) popup.close();
       reject(error);
     };
-    const onResponse = (event: IpcMainEvent, dialogId: unknown, response: unknown): void => {
+    const onResponse = (event: IpcMainEvent, dialogId: unknown, response: unknown, value?: unknown): void => {
       if (event.sender !== popup.webContents || dialogId !== id || !Number.isInteger(response)) return;
       const index = response as number;
-      if (index >= 0 && index < buttons.length) finish(index);
+      if (index >= 0 && index < buttons.length) finish(index, typeof value === 'string' ? value.slice(0, 2000) : null);
     };
 
     ipcMain.on('browser-dialog:response', onResponse);
@@ -115,6 +119,11 @@ function showBrowserDialog(options: Partial<BrowserDialogOptions> & Pick<Browser
     popup.once('closed', () => finish(cancelId));
     void popup.loadFile(path.join(DIST, 'chrome', 'dialog.html')).catch(fail);
   });
+}
+
+/** Обычное окно с кнопками: возвращает только номер нажатой кнопки. */
+function showBrowserDialog(options: Partial<BrowserDialogOptions> & Pick<BrowserDialogOptions, 'kind' | 'title' | 'message'>): Promise<number> {
+  return openBrowserDialog(options).then((r) => r.response);
 }
 
 if (!app.requestSingleInstanceLock()) {
@@ -522,6 +531,68 @@ function registerIpc(): void {
     apiBase: API_BASE,
     engines: Object.entries(SEARCH_ENGINES).map(([id, e]) => ({ id, name: e.name })),
   }));
+  // alert(), confirm() и prompt() сайтов. Электрон не умеет prompt() и показывает alert/confirm
+  // системным окном, поэтому preload шлёт синхронный запрос сюда, а ответ даёт окно браузера.
+  type SyncDialogType = 'alert' | 'confirm' | 'prompt';
+  let syncDialogBusy = false;
+  const recentDialogs = new Map<number, number[]>(); // время последних окон по вкладкам
+  const blockedUntil = new Map<number, number>(); // вкладки, которым окна временно запрещены
+
+  ipcMain.on('browser-dialog-sync', (event, payload: unknown) => {
+    const p = payload && typeof payload === 'object' ? (payload as { type?: unknown; message?: unknown; value?: unknown }) : {};
+    const type: SyncDialogType = p.type === 'alert' || p.type === 'confirm' ? p.type : 'prompt';
+    // Что получит страница, если окно не показано или закрыто: alert — ничего, confirm — false, prompt — null.
+    const fallback = (): string | boolean | null => (type === 'confirm' ? false : null);
+    const reply = (value: string | boolean | null): void => {
+      try {
+        event.returnValue = value;
+      } catch {
+        /* вкладка уже закрыта */
+      }
+    };
+    const tab = tabs?.all().find((t) => t.view.webContents === event.sender);
+    if (!tab || syncDialogBusy || event.senderFrame !== event.sender.mainFrame) return reply(fallback());
+
+    // Защита от бесконечных окон: больше 3 за 5 секунд — молчим 30 секунд.
+    const id = event.sender.id;
+    const now = Date.now();
+    if ((blockedUntil.get(id) ?? 0) > now) return reply(fallback());
+    const times = (recentDialogs.get(id) ?? []).filter((t) => now - t < 5000);
+    if (times.length >= 3) {
+      blockedUntil.set(id, now + 30000);
+      recentDialogs.delete(id);
+      return reply(fallback());
+    }
+    recentDialogs.set(id, [...times, now]);
+
+    let host = '';
+    try {
+      host = new URL(event.sender.getURL()).host;
+    } catch {
+      /* без адреса */
+    }
+    syncDialogBusy = true;
+    tabs.activate(tab.id);
+    openBrowserDialog({
+      kind: type === 'alert' ? 'info' : 'question',
+      title: host ? `${host} ${type === 'alert' ? 'сообщает' : 'спрашивает'}` : type === 'alert' ? 'Страница сообщает' : 'Страница спрашивает',
+      message: str(p.message, 2000),
+      buttons: type === 'alert' ? ['ОК'] : ['ОК', 'Отмена'],
+      defaultId: 0,
+      cancelId: type === 'alert' ? 0 : 1,
+      ...(type === 'prompt' ? { input: { value: str(p.value, 2000) } } : {}),
+    })
+      .then((r) => {
+        if (type === 'prompt') return reply(r.response === 0 ? (r.value ?? '') : null);
+        if (type === 'confirm') return reply(r.response === 0);
+        return reply(null);
+      })
+      .catch(() => reply(fallback()))
+      .finally(() => {
+        syncDialogBusy = false;
+      });
+  });
+
   page('browser:confirm', (message: unknown) =>
     showBrowserDialog({
       kind: 'question',

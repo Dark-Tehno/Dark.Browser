@@ -21,3 +21,5 @@ p{margin:0;color:var(--text-muted);line-height:1.55;overflow-wrap:anywhere;}
 .actions button.primary{border:0;background:var(--gradient);color:#0a0d18;font-weight:700;}
 .actions button.primary:hover{filter:brightness(1.08);}
 .actions button:focus-visible,.close:focus-visible{outline:2px solid var(--cyan);outline-offset:2px;}
+.dialog-input{margin-top:14px;}
+.dialog-input[hidden]{display:none;}

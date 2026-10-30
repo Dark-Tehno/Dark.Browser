@@ -172,11 +172,13 @@ interface BrowserDialogData {
   buttons: string[];
   defaultId: number;
   cancelId: number;
+  /** Если задано — в окне показывается поле ввода (для prompt()). */
+  input?: { value: string };
 }
 
 interface BrowserDialogApi {
   onShow(cb: (data: BrowserDialogData) => void): void;
-  respond(id: string, response: number): void;
+  respond(id: string, response: number, value?: string): void;
 }
 
 interface Window {
